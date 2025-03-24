@@ -1,3 +1,5 @@
+NOTE: 参见 [agent_ref/doc]
+
 ## RULES
 1. 透明封装? 
 2. 变更: 将修改点记录到 OVERWRITE.md
@@ -21,7 +23,7 @@
 3. 通过git submodule将SDK引入应用仓库 (pip install -e ./lib/openai-agents)
 4. 定期执行上游同步：
 ```sh
-git remote add upstream [原仓库URL]
+git remote add upstream https://github.com/openai/openai-agents-python
 git fetch upstream
 git merge upstream/main
 ```
