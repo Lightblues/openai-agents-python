@@ -928,7 +928,7 @@ class _Converter:
                     type="function",
                     function={
                         "name": func_call["name"],
-                        "arguments": func_call["arguments"],
+                        "arguments": func_call["arguments"] or "{}",
                     },
                 )
                 tool_calls.append(new_tool_call)
