@@ -14,6 +14,12 @@ dependencies = [
     "requests>=2.0, <3",
     "types-requests>=2.0, <3",
     "mcp; python_version >= '3.10'",
+    "arize-phoenix-otel>=0.9.0",
+    "openinference-instrumentation-openai>=0.1.22",
+    "openinference-instrumentation-openai-agents>=0.1.7",
+    "openinference-semantic-conventions>=0.1.17",
+    "opentelemetry-api>=1.31.1",
+    "opentelemetry-sdk>=1.31.1",
 ]
 classifiers = [
     "Typing :: Typed",
