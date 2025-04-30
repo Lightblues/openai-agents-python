@@ -7,7 +7,7 @@ from agents import ModelSettings, ModelTracing, OpenAIResponsesModel, trace
 from agents.tracing.span_data import ResponseSpanData
 from tests import fake_model
 
-from .testing_processor import fetch_normalized_spans, fetch_ordered_spans
+from .testing_processor import assert_no_spans, fetch_normalized_spans, fetch_ordered_spans
 
 
 class DummyTracing:
@@ -44,7 +44,14 @@ async def test_get_response_creates_trace(monkeypatch):
 
         # Mock _fetch_response to return a dummy response with a known id
         async def dummy_fetch_response(
-            system_instructions, input, model_settings, tools, output_schema, handoffs, stream
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            prev_response_id,
+            stream,
         ):
             return DummyResponse()
 
@@ -52,7 +59,14 @@ async def test_get_response_creates_trace(monkeypatch):
 
         # Call get_response
         await model.get_response(
-            "instr", "input", ModelSettings(), [], None, [], ModelTracing.ENABLED
+            "instr",
+            "input",
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.ENABLED,
+            previous_response_id=None,
         )
 
     assert fetch_normalized_spans() == snapshot(
@@ -64,13 +78,6 @@ async def test_get_response_creates_trace(monkeypatch):
         ]
     )
 
-    spans = fetch_ordered_spans()
-    assert len(spans) == 1
-
-    assert isinstance(spans[0].span_data, ResponseSpanData)
-    assert spans[0].span_data.response is not None
-    assert spans[0].span_data.response.id == "dummy-id"
-
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
@@ -81,7 +88,14 @@ async def test_non_data_tracing_doesnt_set_response_id(monkeypatch):
 
         # Mock _fetch_response to return a dummy response with a known id
         async def dummy_fetch_response(
-            system_instructions, input, model_settings, tools, output_schema, handoffs, stream
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            prev_response_id,
+            stream,
         ):
             return DummyResponse()
 
@@ -89,16 +103,22 @@ async def test_non_data_tracing_doesnt_set_response_id(monkeypatch):
 
         # Call get_response
         await model.get_response(
-            "instr", "input", ModelSettings(), [], None, [], ModelTracing.ENABLED_WITHOUT_DATA
+            "instr",
+            "input",
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.ENABLED_WITHOUT_DATA,
+            previous_response_id=None,
         )
 
     assert fetch_normalized_spans() == snapshot(
         [{"workflow_name": "test", "children": [{"type": "response"}]}]
     )
 
-    spans = fetch_ordered_spans()
-    assert len(spans) == 1
-    assert spans[0].span_data.response is None
+    [span] = fetch_ordered_spans()
+    assert span.span_data.response is None
 
 
 @pytest.mark.allow_call_model_methods
@@ -110,7 +130,14 @@ async def test_disable_tracing_does_not_create_span(monkeypatch):
 
         # Mock _fetch_response to return a dummy response with a known id
         async def dummy_fetch_response(
-            system_instructions, input, model_settings, tools, output_schema, handoffs, stream
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            prev_response_id,
+            stream,
         ):
             return DummyResponse()
 
@@ -118,13 +145,19 @@ async def test_disable_tracing_does_not_create_span(monkeypatch):
 
         # Call get_response
         await model.get_response(
-            "instr", "input", ModelSettings(), [], None, [], ModelTracing.DISABLED
+            "instr",
+            "input",
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.DISABLED,
+            previous_response_id=None,
         )
 
     assert fetch_normalized_spans() == snapshot([{"workflow_name": "test"}])
 
-    spans = fetch_ordered_spans()
-    assert len(spans) == 0
+    assert_no_spans()
 
 
 @pytest.mark.allow_call_model_methods
@@ -136,7 +169,14 @@ async def test_stream_response_creates_trace(monkeypatch):
 
         # Define a dummy fetch function that returns an async stream with a dummy response
         async def dummy_fetch_response(
-            system_instructions, input, model_settings, tools, output_schema, handoffs, stream
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            prev_response_id,
+            stream,
         ):
             class DummyStream:
                 async def __aiter__(self):
@@ -151,7 +191,14 @@ async def test_stream_response_creates_trace(monkeypatch):
 
         # Consume the stream to trigger processing of the final response
         async for _ in model.stream_response(
-            "instr", "input", ModelSettings(), [], None, [], ModelTracing.ENABLED
+            "instr",
+            "input",
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.ENABLED,
+            previous_response_id=None,
         ):
             pass
 
@@ -164,12 +211,6 @@ async def test_stream_response_creates_trace(monkeypatch):
         ]
     )
 
-    spans = fetch_ordered_spans()
-    assert len(spans) == 1
-    assert isinstance(spans[0].span_data, ResponseSpanData)
-    assert spans[0].span_data.response is not None
-    assert spans[0].span_data.response.id == "dummy-id-123"
-
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
@@ -180,7 +221,14 @@ async def test_stream_non_data_tracing_doesnt_set_response_id(monkeypatch):
 
         # Define a dummy fetch function that returns an async stream with a dummy response
         async def dummy_fetch_response(
-            system_instructions, input, model_settings, tools, output_schema, handoffs, stream
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            prev_response_id,
+            stream,
         ):
             class DummyStream:
                 async def __aiter__(self):
@@ -195,7 +243,14 @@ async def test_stream_non_data_tracing_doesnt_set_response_id(monkeypatch):
 
         # Consume the stream to trigger processing of the final response
         async for _ in model.stream_response(
-            "instr", "input", ModelSettings(), [], None, [], ModelTracing.ENABLED_WITHOUT_DATA
+            "instr",
+            "input",
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.ENABLED_WITHOUT_DATA,
+            previous_response_id=None,
         ):
             pass
 
@@ -203,10 +258,9 @@ async def test_stream_non_data_tracing_doesnt_set_response_id(monkeypatch):
         [{"workflow_name": "test", "children": [{"type": "response"}]}]
     )
 
-    spans = fetch_ordered_spans()
-    assert len(spans) == 1
-    assert isinstance(spans[0].span_data, ResponseSpanData)
-    assert spans[0].span_data.response is None
+    [span] = fetch_ordered_spans()
+    assert isinstance(span.span_data, ResponseSpanData)
+    assert span.span_data.response is None
 
 
 @pytest.mark.allow_call_model_methods
@@ -218,7 +272,14 @@ async def test_stream_disabled_tracing_doesnt_create_span(monkeypatch):
 
         # Define a dummy fetch function that returns an async stream with a dummy response
         async def dummy_fetch_response(
-            system_instructions, input, model_settings, tools, output_schema, handoffs, stream
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            prev_response_id,
+            stream,
         ):
             class DummyStream:
                 async def __aiter__(self):
@@ -233,11 +294,17 @@ async def test_stream_disabled_tracing_doesnt_create_span(monkeypatch):
 
         # Consume the stream to trigger processing of the final response
         async for _ in model.stream_response(
-            "instr", "input", ModelSettings(), [], None, [], ModelTracing.DISABLED
+            "instr",
+            "input",
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.DISABLED,
+            previous_response_id=None,
         ):
             pass
 
     assert fetch_normalized_spans() == snapshot([{"workflow_name": "test"}])
 
-    spans = fetch_ordered_spans()
-    assert len(spans) == 0
+    assert_no_spans()

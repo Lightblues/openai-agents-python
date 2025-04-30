@@ -5,7 +5,7 @@ import enum
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
-from ..agent_output import AgentOutputSchema
+from ..agent_output import AgentOutputSchemaBase
 from ..handoffs import Handoff
 from ..items import ModelResponse, TResponseInputItem, TResponseStreamEvent
 from ..tool import Tool
@@ -41,9 +41,11 @@ class Model(abc.ABC):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
     ) -> ModelResponse:
         """Get a response from the model.
 
@@ -55,6 +57,8 @@ class Model(abc.ABC):
             output_schema: The output schema to use.
             handoffs: The handoffs available to the model.
             tracing: Tracing configuration.
+            previous_response_id: the ID of the previous response. Generally not used by the model,
+                except for the OpenAI Responses API.
 
         Returns:
             The full model response.
@@ -68,9 +72,11 @@ class Model(abc.ABC):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         """Stream a response from the model.
 
@@ -82,6 +88,8 @@ class Model(abc.ABC):
             output_schema: The output schema to use.
             handoffs: The handoffs available to the model.
             tracing: Tracing configuration.
+            previous_response_id: the ID of the previous response. Generally not used by the model,
+                except for the OpenAI Responses API.
 
         Returns:
             An iterator of response stream events, in OpenAI Responses format.

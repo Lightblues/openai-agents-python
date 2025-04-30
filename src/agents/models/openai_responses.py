@@ -18,7 +18,7 @@ from openai.types.responses import (
 )
 
 from .. import _debug
-from ..agent_output import AgentOutputSchema
+from ..agent_output import AgentOutputSchemaBase
 from ..exceptions import UserError
 from ..handoffs import Handoff
 from ..items import ItemHelpers, ModelResponse, TResponseInputItem
@@ -66,9 +66,10 @@ class OpenAIResponsesModel(Model):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
+        previous_response_id: str | None,
     ) -> ModelResponse:
         with response_span(disabled=tracing.is_disabled()) as span_response:
             try:
@@ -79,11 +80,12 @@ class OpenAIResponsesModel(Model):
                     tools,
                     output_schema,
                     handoffs,
+                    previous_response_id,
                     stream=False,
                 )
 
                 if _debug.DONT_LOG_MODEL_DATA:
-                    logger.debug("LLM responsed")
+                    logger.debug("LLM responded")
                 else:
                     logger.debug(
                         "LLM resp:\n"
@@ -120,7 +122,7 @@ class OpenAIResponsesModel(Model):
         return ModelResponse(
             output=response.output,
             usage=usage,
-            referenceable_id=response.id,
+            response_id=response.id,
         )
 
     async def stream_response(
@@ -129,9 +131,10 @@ class OpenAIResponsesModel(Model):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
+        previous_response_id: str | None,
     ) -> AsyncIterator[ResponseStreamEvent]:
         """
         Yields a partial message as it is generated, as well as the usage information.
@@ -145,6 +148,7 @@ class OpenAIResponsesModel(Model):
                     tools,
                     output_schema,
                     handoffs,
+                    previous_response_id,
                     stream=True,
                 )
 
@@ -178,8 +182,9 @@ class OpenAIResponsesModel(Model):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
+        previous_response_id: str | None,
         stream: Literal[True],
     ) -> AsyncStream[ResponseStreamEvent]: ...
 
@@ -190,8 +195,9 @@ class OpenAIResponsesModel(Model):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
+        previous_response_id: str | None,
         stream: Literal[False],
     ) -> Response: ...
 
@@ -201,14 +207,19 @@ class OpenAIResponsesModel(Model):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
+        previous_response_id: str | None,
         stream: Literal[True] | Literal[False] = False,
     ) -> Response | AsyncStream[ResponseStreamEvent]:
         list_input = ItemHelpers.input_to_new_input_list(input)
 
         parallel_tool_calls = (
-            True if model_settings.parallel_tool_calls and tools and len(tools) > 0 else NOT_GIVEN
+            True
+            if model_settings.parallel_tool_calls and tools and len(tools) > 0
+            else False
+            if model_settings.parallel_tool_calls is False
+            else NOT_GIVEN
         )
 
         tool_choice = Converter.convert_tool_choice(model_settings.tool_choice)
@@ -225,9 +236,11 @@ class OpenAIResponsesModel(Model):
                 f"Stream: {stream}\n"
                 f"Tool choice: {tool_choice}\n"
                 f"Response format: {response_format}\n"
+                f"Previous response id: {previous_response_id}\n"
             )
 
         return await self._client.responses.create(
+            previous_response_id=self._non_null_or_not_given(previous_response_id),
             instructions=self._non_null_or_not_given(system_instructions),
             model=self.model,
             input=list_input,
@@ -240,8 +253,13 @@ class OpenAIResponsesModel(Model):
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             stream=stream,
-            extra_headers=_HEADERS,
+            extra_headers={**_HEADERS, **(model_settings.extra_headers or {})},
+            extra_query=model_settings.extra_query,
+            extra_body=model_settings.extra_body,
             text=response_format,
+            store=self._non_null_or_not_given(model_settings.store),
+            reasoning=self._non_null_or_not_given(model_settings.reasoning),
+            metadata=self._non_null_or_not_given(model_settings.metadata),
         )
 
     def _get_client(self) -> AsyncOpenAI:
@@ -289,7 +307,7 @@ class Converter:
 
     @classmethod
     def get_response_format(
-        cls, output_schema: AgentOutputSchema | None
+        cls, output_schema: AgentOutputSchemaBase | None
     ) -> ResponseTextConfigParam | NotGiven:
         if output_schema is None or output_schema.is_plain_text():
             return NOT_GIVEN
@@ -299,7 +317,7 @@ class Converter:
                     "type": "json_schema",
                     "name": "final_output",
                     "schema": output_schema.json_schema(),
-                    "strict": output_schema.strict_json_schema,
+                    "strict": output_schema.is_strict_json_schema(),
                 }
             }
 

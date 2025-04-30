@@ -10,11 +10,12 @@ from typing_extensions import TypeVar
 
 from ._run_impl import QueueCompleteSentinel
 from .agent import Agent
-from .agent_output import AgentOutputSchema
+from .agent_output import AgentOutputSchemaBase
 from .exceptions import InputGuardrailTripwireTriggered, MaxTurnsExceeded
 from .guardrail import InputGuardrailResult, OutputGuardrailResult
 from .items import ItemHelpers, ModelResponse, RunItem, TResponseInputItem
 from .logger import logger
+from .run_context import RunContextWrapper
 from .stream_events import StreamEvent
 from .tracing import Trace
 from .util._pretty_print import pretty_print_result, pretty_print_run_result_streaming
@@ -50,6 +51,9 @@ class RunResultBase(abc.ABC):
     output_guardrail_results: list[OutputGuardrailResult]
     """Guardrail results for the final output of the agent."""
 
+    context_wrapper: RunContextWrapper[Any]
+    """The context wrapper for the agent run."""
+
     @property
     @abc.abstractmethod
     def last_agent(self) -> Agent[Any]:
@@ -79,6 +83,14 @@ class RunResultBase(abc.ABC):
         new_items = [item.to_input_item() for item in self.new_items]
 
         return original_items + new_items
+
+    @property
+    def last_response_id(self) -> str | None:
+        """Convenience method to get the response ID of the last model response."""
+        if not self.raw_responses:
+            return None
+
+        return self.raw_responses[-1].response_id
 
 
 @dataclass
@@ -116,9 +128,9 @@ class RunResultStreaming(RunResultBase):
     final_output: Any
     """The final output of the agent. This is None until the agent has finished running."""
 
-    _current_agent_output_schema: AgentOutputSchema | None = field(repr=False)
+    _current_agent_output_schema: AgentOutputSchemaBase | None = field(repr=False)
 
-    _trace: Trace | None = field(repr=False)
+    trace: Trace | None = field(repr=False)
 
     is_complete: bool = False
     """Whether the agent has finished running."""
@@ -143,6 +155,18 @@ class RunResultStreaming(RunResultBase):
         is only available after the agent run is complete.
         """
         return self.current_agent
+
+    def cancel(self) -> None:
+        """Cancels the streaming run, stopping all background tasks and marking the run as
+        complete."""
+        self._cleanup_tasks()  # Cancel all running tasks
+        self.is_complete = True  # Mark the run as complete to stop event streaming
+
+        # Optionally, clear the event queue to prevent processing stale events
+        while not self._event_queue.empty():
+            self._event_queue.get_nowait()
+        while not self._input_guardrail_queue.empty():
+            self._input_guardrail_queue.get_nowait()
 
     async def stream_events(self) -> AsyncIterator[StreamEvent]:
         """Stream deltas for new items as they are generated. We're using the types from the
@@ -176,9 +200,6 @@ class RunResultStreaming(RunResultBase):
 
             yield item
             self._event_queue.task_done()
-
-        if self._trace:
-            self._trace.finish(reset_current=True)
 
         self._cleanup_tasks()
 

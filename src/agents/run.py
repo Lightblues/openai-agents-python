@@ -8,6 +8,7 @@ from typing import Any, cast
 from openai.types.responses import ResponseCompletedEvent
 
 from ._run_impl import (
+    AgentToolUseTracker,
     NextStepFinalOutput,
     NextStepHandoff,
     NextStepRunAgain,
@@ -18,7 +19,7 @@ from ._run_impl import (
     get_model_tracing_impl,
 )
 from .agent import Agent
-from .agent_output import AgentOutputSchema
+from .agent_output import AgentOutputSchema, AgentOutputSchemaBase
 from .exceptions import (
     AgentsException,
     InputGuardrailTripwireTriggered,
@@ -33,10 +34,11 @@ from .lifecycle import RunHooks
 from .logger import logger
 from .model_settings import ModelSettings
 from .models.interface import Model, ModelProvider
-from .models.openai_provider import OpenAIProvider
+from .models.multi_provider import MultiProvider
 from .result import RunResult, RunResultStreaming
 from .run_context import RunContextWrapper, TContext
 from .stream_events import AgentUpdatedStreamEvent, RawResponsesStreamEvent
+from .tool import Tool
 from .tracing import Span, SpanError, agent_span, get_current_trace, trace
 from .tracing.span_data import AgentSpanData
 from .usage import Usage
@@ -54,7 +56,7 @@ class RunConfig:
     agent. The model_provider passed in below must be able to resolve this model name.
     """
 
-    model_provider: ModelProvider = field(default_factory=OpenAIProvider)
+    model_provider: ModelProvider = field(default_factory=MultiProvider)
     """The model provider to use when looking up string model names. Defaults to OpenAI."""
 
     model_settings: ModelSettings | None = None
@@ -115,6 +117,7 @@ class Runner:
         max_turns: int = DEFAULT_MAX_TURNS,
         hooks: RunHooks[TContext] | None = None,
         run_config: RunConfig | None = None,
+        previous_response_id: str | None = None,
     ) -> RunResult:
         """Run a workflow starting at the given agent. The agent will run in a loop until a final
         output is generated. The loop runs like so:
@@ -139,6 +142,8 @@ class Runner:
                 AI invocation (including any tool calls that might occur).
             hooks: An object that receives callbacks on various lifecycle events.
             run_config: Global settings for the entire agent run.
+            previous_response_id: The ID of the previous response, if using OpenAI models via the
+                Responses API, this allows you to skip passing in input from the previous turn.
 
         Returns:
             A run result containing all the inputs, guardrail results and the output of the last
@@ -148,6 +153,8 @@ class Runner:
             hooks = RunHooks[Any]()
         if run_config is None:
             run_config = RunConfig()
+
+        tool_use_tracker = AgentToolUseTracker()
 
         with TraceCtxManager(
             workflow_name=run_config.workflow_name,
@@ -177,19 +184,20 @@ class Runner:
                     # agent changes, or if the agent loop ends.
                     if current_span is None:
                         handoff_names = [h.agent_name for h in cls._get_handoffs(current_agent)]
-                        tool_names = [t.name for t in current_agent.tools]
                         if output_schema := cls._get_output_schema(current_agent):
-                            output_type_name = output_schema.output_type_name()
+                            output_type_name = output_schema.name()
                         else:
                             output_type_name = "str"
 
                         current_span = agent_span(
                             name=current_agent.name,
                             handoffs=handoff_names,
-                            tools=tool_names,
                             output_type=output_type_name,
                         )
                         current_span.start(mark_as_current=True)
+
+                        all_tools = await cls._get_all_tools(current_agent)
+                        current_span.span_data.tools = [t.name for t in all_tools]
 
                     current_turn += 1
                     if current_turn > max_turns:
@@ -217,23 +225,29 @@ class Runner:
                             ),
                             cls._run_single_turn(
                                 agent=current_agent,
+                                all_tools=all_tools,
                                 original_input=original_input,
                                 generated_items=generated_items,
                                 hooks=hooks,
                                 context_wrapper=context_wrapper,
                                 run_config=run_config,
                                 should_run_agent_start_hooks=should_run_agent_start_hooks,
+                                tool_use_tracker=tool_use_tracker,
+                                previous_response_id=previous_response_id,
                             ),
                         )
                     else:
                         turn_result = await cls._run_single_turn(
                             agent=current_agent,
+                            all_tools=all_tools,
                             original_input=original_input,
                             generated_items=generated_items,
                             hooks=hooks,
                             context_wrapper=context_wrapper,
                             run_config=run_config,
                             should_run_agent_start_hooks=should_run_agent_start_hooks,
+                            tool_use_tracker=tool_use_tracker,
+                            previous_response_id=previous_response_id,
                         )
                     should_run_agent_start_hooks = False
 
@@ -256,6 +270,7 @@ class Runner:
                             _last_agent=current_agent,
                             input_guardrail_results=input_guardrail_results,
                             output_guardrail_results=output_guardrail_results,
+                            context_wrapper=context_wrapper,
                         )
                     elif isinstance(turn_result.next_step, NextStepHandoff):
                         current_agent = cast(Agent[TContext], turn_result.next_step.new_agent)
@@ -282,6 +297,7 @@ class Runner:
         max_turns: int = DEFAULT_MAX_TURNS,
         hooks: RunHooks[TContext] | None = None,
         run_config: RunConfig | None = None,
+        previous_response_id: str | None = None,
     ) -> RunResult:
         """Run a workflow synchronously, starting at the given agent. Note that this just wraps the
         `run` method, so it will not work if there's already an event loop (e.g. inside an async
@@ -310,6 +326,8 @@ class Runner:
                 AI invocation (including any tool calls that might occur).
             hooks: An object that receives callbacks on various lifecycle events.
             run_config: Global settings for the entire agent run.
+            previous_response_id: The ID of the previous response, if using OpenAI models via the
+                Responses API, this allows you to skip passing in input from the previous turn.
 
         Returns:
             A run result containing all the inputs, guardrail results and the output of the last
@@ -323,6 +341,7 @@ class Runner:
                 max_turns=max_turns,
                 hooks=hooks,
                 run_config=run_config,
+                previous_response_id=previous_response_id,
             )
         )
 
@@ -335,6 +354,7 @@ class Runner:
         max_turns: int = DEFAULT_MAX_TURNS,
         hooks: RunHooks[TContext] | None = None,
         run_config: RunConfig | None = None,
+        previous_response_id: str | None = None,
     ) -> RunResultStreaming:
         """Run a workflow starting at the given agent in streaming mode. The returned result object
         contains a method you can use to stream semantic events as they are generated.
@@ -361,7 +381,8 @@ class Runner:
                 AI invocation (including any tool calls that might occur).
             hooks: An object that receives callbacks on various lifecycle events.
             run_config: Global settings for the entire agent run.
-
+            previous_response_id: The ID of the previous response, if using OpenAI models via the
+                Responses API, this allows you to skip passing in input from the previous turn.
         Returns:
             A result object that contains data about the run, as well as a method to stream events.
         """
@@ -384,10 +405,6 @@ class Runner:
                 disabled=run_config.tracing_disabled,
             )
         )
-        # Need to start the trace here, because the current trace contextvar is captured at
-        # asyncio.create_task time
-        if new_trace:
-            new_trace.start(mark_as_current=True)
 
         output_schema = cls._get_output_schema(starting_agent)
         context_wrapper: RunContextWrapper[TContext] = RunContextWrapper(
@@ -406,7 +423,8 @@ class Runner:
             input_guardrail_results=[],
             output_guardrail_results=[],
             _current_agent_output_schema=output_schema,
-            _trace=new_trace,
+            trace=new_trace,
+            context_wrapper=context_wrapper,
         )
 
         # Kick off the actual agent loop in the background and return the streamed result object.
@@ -419,6 +437,7 @@ class Runner:
                 hooks=hooks,
                 context_wrapper=context_wrapper,
                 run_config=run_config,
+                previous_response_id=previous_response_id,
             )
         )
         return streamed_result
@@ -476,11 +495,16 @@ class Runner:
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         run_config: RunConfig,
+        previous_response_id: str | None,
     ):
+        if streamed_result.trace:
+            streamed_result.trace.start(mark_as_current=True)
+
         current_span: Span[AgentSpanData] | None = None
         current_agent = starting_agent
         current_turn = 0
         should_run_agent_start_hooks = True
+        tool_use_tracker = AgentToolUseTracker()
 
         streamed_result._event_queue.put_nowait(AgentUpdatedStreamEvent(new_agent=current_agent))
 
@@ -493,20 +517,21 @@ class Runner:
                 # agent changes, or if the agent loop ends.
                 if current_span is None:
                     handoff_names = [h.agent_name for h in cls._get_handoffs(current_agent)]
-                    tool_names = [t.name for t in current_agent.tools]
                     if output_schema := cls._get_output_schema(current_agent):
-                        output_type_name = output_schema.output_type_name()
+                        output_type_name = output_schema.name()
                     else:
                         output_type_name = "str"
 
                     current_span = agent_span(
                         name=current_agent.name,
                         handoffs=handoff_names,
-                        tools=tool_names,
                         output_type=output_type_name,
                     )
                     current_span.start(mark_as_current=True)
 
+                    all_tools = await cls._get_all_tools(current_agent)
+                    tool_names = [t.name for t in all_tools]
+                    current_span.span_data.tools = tool_names
                 current_turn += 1
                 streamed_result.current_turn = current_turn
 
@@ -541,6 +566,9 @@ class Runner:
                         context_wrapper,
                         run_config,
                         should_run_agent_start_hooks,
+                        tool_use_tracker,
+                        all_tools,
+                        previous_response_id,
                     )
                     should_run_agent_start_hooks = False
 
@@ -598,6 +626,8 @@ class Runner:
         finally:
             if current_span:
                 current_span.finish(reset_current=True)
+            if streamed_result.trace:
+                streamed_result.trace.finish(reset_current=True)
 
     @classmethod
     async def _run_single_turn_streamed(
@@ -608,6 +638,9 @@ class Runner:
         context_wrapper: RunContextWrapper[TContext],
         run_config: RunConfig,
         should_run_agent_start_hooks: bool,
+        tool_use_tracker: AgentToolUseTracker,
+        all_tools: list[Tool],
+        previous_response_id: str | None,
     ) -> SingleStepResult:
         if should_run_agent_start_hooks:
             await asyncio.gather(
@@ -627,9 +660,10 @@ class Runner:
         system_prompt = await agent.get_system_prompt(context_wrapper)
 
         handoffs = cls._get_handoffs(agent)
-
         model = cls._get_model(agent, run_config)
         model_settings = agent.model_settings.resolve(run_config.model_settings)
+        model_settings = RunImpl.maybe_reset_tool_choice(agent, tool_use_tracker, model_settings)
+
         final_response: ModelResponse | None = None
 
         input = ItemHelpers.input_to_new_input_list(streamed_result.input)
@@ -640,12 +674,13 @@ class Runner:
             system_prompt,
             input,
             model_settings,
-            agent.tools,
+            all_tools,
             output_schema,
             handoffs,
             get_model_tracing_impl(
                 run_config.tracing_disabled, run_config.trace_include_sensitive_data
             ),
+            previous_response_id=previous_response_id,
         ):
             if isinstance(event, ResponseCompletedEvent):
                 usage = (
@@ -661,8 +696,9 @@ class Runner:
                 final_response = ModelResponse(
                     output=event.response.output,
                     usage=usage,
-                    referenceable_id=event.response.id,
+                    response_id=event.response.id,
                 )
+                context_wrapper.usage.add(usage)
 
             streamed_result._event_queue.put_nowait(RawResponsesStreamEvent(data=event))
 
@@ -677,10 +713,12 @@ class Runner:
             pre_step_items=streamed_result.new_items,
             new_response=final_response,
             output_schema=output_schema,
+            all_tools=all_tools,
             handoffs=handoffs,
             hooks=hooks,
             context_wrapper=context_wrapper,
             run_config=run_config,
+            tool_use_tracker=tool_use_tracker,
         )
 
         RunImpl.stream_step_result_to_queue(single_step_result, streamed_result._event_queue)
@@ -691,12 +729,15 @@ class Runner:
         cls,
         *,
         agent: Agent[TContext],
+        all_tools: list[Tool],
         original_input: str | list[TResponseInputItem],
         generated_items: list[RunItem],
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         run_config: RunConfig,
         should_run_agent_start_hooks: bool,
+        tool_use_tracker: AgentToolUseTracker,
+        previous_response_id: str | None,
     ) -> SingleStepResult:
         # Ensure we run the hooks before anything else
         if should_run_agent_start_hooks:
@@ -721,9 +762,12 @@ class Runner:
             system_prompt,
             input,
             output_schema,
+            all_tools,
             handoffs,
             context_wrapper,
             run_config,
+            tool_use_tracker,
+            previous_response_id,
         )
 
         return await cls._get_single_step_result_from_response(
@@ -732,10 +776,12 @@ class Runner:
             pre_step_items=generated_items,
             new_response=new_response,
             output_schema=output_schema,
+            all_tools=all_tools,
             handoffs=handoffs,
             hooks=hooks,
             context_wrapper=context_wrapper,
             run_config=run_config,
+            tool_use_tracker=tool_use_tracker,
         )
 
     @classmethod
@@ -743,21 +789,27 @@ class Runner:
         cls,
         *,
         agent: Agent[TContext],
+        all_tools: list[Tool],
         original_input: str | list[TResponseInputItem],
         pre_step_items: list[RunItem],
         new_response: ModelResponse,
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         run_config: RunConfig,
+        tool_use_tracker: AgentToolUseTracker,
     ) -> SingleStepResult:
         processed_response = RunImpl.process_model_response(
             agent=agent,
+            all_tools=all_tools,
             response=new_response,
             output_schema=output_schema,
             handoffs=handoffs,
         )
+
+        tool_use_tracker.add_tool_use(agent, processed_response.tools_used)
+
         return await RunImpl.execute_tools_and_side_effects(
             agent=agent,
             original_input=original_input,
@@ -852,23 +904,29 @@ class Runner:
         agent: Agent[TContext],
         system_prompt: str | None,
         input: list[TResponseInputItem],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
+        all_tools: list[Tool],
         handoffs: list[Handoff],
         context_wrapper: RunContextWrapper[TContext],
         run_config: RunConfig,
+        tool_use_tracker: AgentToolUseTracker,
+        previous_response_id: str | None,
     ) -> ModelResponse:
         model = cls._get_model(agent, run_config)
         model_settings = agent.model_settings.resolve(run_config.model_settings)
+        model_settings = RunImpl.maybe_reset_tool_choice(agent, tool_use_tracker, model_settings)
+
         new_response = await model.get_response(
             system_instructions=system_prompt,
             input=input,
             model_settings=model_settings,
-            tools=agent.tools,
+            tools=all_tools,
             output_schema=output_schema,
             handoffs=handoffs,
             tracing=get_model_tracing_impl(
                 run_config.tracing_disabled, run_config.trace_include_sensitive_data
             ),
+            previous_response_id=previous_response_id,
         )
 
         context_wrapper.usage.add(new_response.usage)
@@ -876,9 +934,11 @@ class Runner:
         return new_response
 
     @classmethod
-    def _get_output_schema(cls, agent: Agent[Any]) -> AgentOutputSchema | None:
+    def _get_output_schema(cls, agent: Agent[Any]) -> AgentOutputSchemaBase | None:
         if agent.output_type is None or agent.output_type is str:
             return None
+        elif isinstance(agent.output_type, AgentOutputSchemaBase):
+            return agent.output_type
 
         return AgentOutputSchema(agent.output_type)
 
@@ -891,6 +951,10 @@ class Runner:
             elif isinstance(handoff_item, Agent):
                 handoffs.append(handoff(handoff_item))
         return handoffs
+
+    @classmethod
+    async def _get_all_tools(cls, agent: Agent[Any]) -> list[Tool]:
+        return await agent.get_all_tools()
 
     @classmethod
     def _get_model(cls, agent: Agent[Any], run_config: RunConfig) -> Model:

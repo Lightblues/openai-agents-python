@@ -129,8 +129,10 @@ class ToolCallOutputItem(RunItemBase[Union[FunctionCallOutput, ComputerCallOutpu
     raw_item: FunctionCallOutput | ComputerCallOutput
     """The raw item from the model."""
 
-    output: str
-    """The output of the tool call."""
+    output: Any
+    """The output of the tool call. This is whatever the tool call returned; the `raw_item`
+    contains a string representation of the output.
+    """
 
     type: Literal["tool_call_output_item"] = "tool_call_output_item"
 
@@ -164,9 +166,11 @@ class ModelResponse:
     usage: Usage
     """The usage information for the response."""
 
-    referenceable_id: str | None
+    response_id: str | None
     """An ID for the response which can be used to refer to the response in subsequent calls to the
     model. Not supported by all model providers.
+    If using OpenAI models via the Responses API, this is the `response_id` parameter, and it can
+    be passed to `Runner.run`.
     """
 
     def to_input_items(self) -> list[TResponseInputItem]:

@@ -5,6 +5,7 @@ sync:
 .PHONY: format
 format: 
 	uv run ruff format
+	uv run ruff check --fix
 
 .PHONY: lint
 lint: 
@@ -36,10 +37,14 @@ snapshots-create:
 .PHONY: old_version_tests
 old_version_tests: 
 	UV_PROJECT_ENVIRONMENT=.venv_39 uv run --python 3.9 -m pytest
-	UV_PROJECT_ENVIRONMENT=.venv_39 uv run --python 3.9 -m mypy .
 
 .PHONY: build-docs
 build-docs:
+	uv run mkdocs build
+
+.PHONY: build-full-docs
+build-full-docs:
+	uv run docs/scripts/translate_docs.py
 	uv run mkdocs build
 
 .PHONY: serve-docs

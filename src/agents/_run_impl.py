@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+import dataclasses
+import inspect
+from collections.abc import Awaitable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, cast
 
 from openai.types.responses import (
     ResponseComputerToolCall,
@@ -25,8 +28,8 @@ from openai.types.responses.response_computer_tool_call import (
 from openai.types.responses.response_input_param import ComputerCallOutput
 from openai.types.responses.response_reasoning_item import ResponseReasoningItem
 
-from .agent import Agent
-from .agent_output import AgentOutputSchema
+from .agent import Agent, ToolsToFinalOutputResult
+from .agent_output import AgentOutputSchemaBase
 from .computer import AsyncComputer, Computer
 from .exceptions import AgentsException, ModelBehaviorError, UserError
 from .guardrail import InputGuardrail, InputGuardrailResult, OutputGuardrail, OutputGuardrailResult
@@ -45,10 +48,11 @@ from .items import (
 )
 from .lifecycle import RunHooks
 from .logger import logger
+from .model_settings import ModelSettings
 from .models.interface import ModelTracing
 from .run_context import RunContextWrapper, TContext
 from .stream_events import RunItemStreamEvent, StreamEvent
-from .tool import ComputerTool, FunctionTool
+from .tool import ComputerTool, FunctionTool, FunctionToolResult, Tool
 from .tracing import (
     SpanError,
     Trace,
@@ -69,6 +73,25 @@ class QueueCompleteSentinel:
 
 
 QUEUE_COMPLETE_SENTINEL = QueueCompleteSentinel()
+
+_NOT_FINAL_OUTPUT = ToolsToFinalOutputResult(is_final_output=False, final_output=None)
+
+
+@dataclass
+class AgentToolUseTracker:
+    agent_to_tools: list[tuple[Agent, list[str]]] = field(default_factory=list)
+    """Tuple of (agent, list of tools used). Can't use a dict because agents aren't hashable."""
+
+    def add_tool_use(self, agent: Agent[Any], tool_names: list[str]) -> None:
+        existing_data = next((item for item in self.agent_to_tools if item[0] == agent), None)
+        if existing_data:
+            existing_data[1].extend(tool_names)
+        else:
+            self.agent_to_tools.append((agent, tool_names))
+
+    def has_used_tools(self, agent: Agent[Any]) -> bool:
+        existing_data = next((item for item in self.agent_to_tools if item[0] == agent), None)
+        return existing_data is not None and len(existing_data[1]) > 0
 
 
 @dataclass
@@ -95,6 +118,7 @@ class ProcessedResponse:
     handoffs: list[ToolRunHandoff]
     functions: list[ToolRunFunction]
     computer_actions: list[ToolRunComputerAction]
+    tools_used: list[str]  # Names of all tools used, including hosted tools
 
     def has_tools_to_run(self) -> bool:
         # Handoffs, functions and computer actions need local processing
@@ -171,7 +195,7 @@ class RunImpl:
         pre_step_items: list[RunItem],
         new_response: ModelResponse,
         processed_response: ProcessedResponse,
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         run_config: RunConfig,
@@ -199,7 +223,7 @@ class RunImpl:
                 config=run_config,
             ),
         )
-        new_step_items.extend(function_results)
+        new_step_items.extend([result.run_item for result in function_results])
         new_step_items.extend(computer_results)
 
         # Second, check if there are any handoffs
@@ -214,6 +238,36 @@ class RunImpl:
                 hooks=hooks,
                 context_wrapper=context_wrapper,
                 run_config=run_config,
+            )
+
+        # Third, we'll check if the tool use should result in a final output
+        check_tool_use = await cls._check_for_final_output_from_tools(
+            agent=agent,
+            tool_results=function_results,
+            context_wrapper=context_wrapper,
+            config=run_config,
+        )
+
+        if check_tool_use.is_final_output:
+            # If the output type is str, then let's just stringify it
+            if not agent.output_type or agent.output_type is str:
+                check_tool_use.final_output = str(check_tool_use.final_output)
+
+            if check_tool_use.final_output is None:
+                logger.error(
+                    "Model returned a final output of None. Not raising an error because we assume"
+                    "you know what you're doing."
+                )
+
+            return await cls.execute_final_output(
+                agent=agent,
+                original_input=original_input,
+                new_response=new_response,
+                pre_step_items=pre_step_items,
+                new_step_items=new_step_items,
+                final_output=check_tool_use.final_output,
+                hooks=hooks,
+                context_wrapper=context_wrapper,
             )
 
         # Now we can check if the model also produced a final output
@@ -263,12 +317,25 @@ class RunImpl:
             )
 
     @classmethod
+    def maybe_reset_tool_choice(
+        cls, agent: Agent[Any], tool_use_tracker: AgentToolUseTracker, model_settings: ModelSettings
+    ) -> ModelSettings:
+        """Resets tool choice to None if the agent has used tools and the agent's reset_tool_choice
+        flag is True."""
+
+        if agent.reset_tool_choice is True and tool_use_tracker.has_used_tools(agent):
+            return dataclasses.replace(model_settings, tool_choice=None)
+
+        return model_settings
+
+    @classmethod
     def process_model_response(
         cls,
         *,
         agent: Agent[Any],
+        all_tools: list[Tool],
         response: ModelResponse,
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
     ) -> ProcessedResponse:
         items: list[RunItem] = []
@@ -276,22 +343,25 @@ class RunImpl:
         run_handoffs = []
         functions = []
         computer_actions = []
-
+        tools_used: list[str] = []
         handoff_map = {handoff.tool_name: handoff for handoff in handoffs}
-        function_map = {tool.name: tool for tool in agent.tools if isinstance(tool, FunctionTool)}
-        computer_tool = next((tool for tool in agent.tools if isinstance(tool, ComputerTool)), None)
+        function_map = {tool.name: tool for tool in all_tools if isinstance(tool, FunctionTool)}
+        computer_tool = next((tool for tool in all_tools if isinstance(tool, ComputerTool)), None)
 
         for output in response.output:
             if isinstance(output, ResponseOutputMessage):
                 items.append(MessageOutputItem(raw_item=output, agent=agent))
             elif isinstance(output, ResponseFileSearchToolCall):
                 items.append(ToolCallItem(raw_item=output, agent=agent))
+                tools_used.append("file_search")
             elif isinstance(output, ResponseFunctionWebSearch):
                 items.append(ToolCallItem(raw_item=output, agent=agent))
+                tools_used.append("web_search")
             elif isinstance(output, ResponseReasoningItem):
                 items.append(ReasoningItem(raw_item=output, agent=agent))
             elif isinstance(output, ResponseComputerToolCall):
                 items.append(ToolCallItem(raw_item=output, agent=agent))
+                tools_used.append("computer_use")
                 if not computer_tool:
                     _error_tracing.attach_error_to_current_span(
                         SpanError(
@@ -312,6 +382,8 @@ class RunImpl:
             # At this point we know it's a function tool call
             if not isinstance(output, ResponseFunctionToolCall):
                 continue
+
+            tools_used.append(output.name)
 
             # Handoffs
             if output.name in handoff_map:
@@ -344,6 +416,7 @@ class RunImpl:
             handoffs=run_handoffs,
             functions=functions,
             computer_actions=computer_actions,
+            tools_used=tools_used,
         )
 
     @classmethod
@@ -355,10 +428,10 @@ class RunImpl:
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         config: RunConfig,
-    ) -> list[RunItem]:
+    ) -> list[FunctionToolResult]:
         async def run_single_tool(
             func_tool: FunctionTool, tool_call: ResponseFunctionToolCall
-        ) -> str:
+        ) -> Any:
             with function_span(func_tool.name) as span_fn:
                 if config.trace_include_sensitive_data:
                     span_fn.span_data.input = tool_call.arguments
@@ -404,10 +477,14 @@ class RunImpl:
         results = await asyncio.gather(*tasks)
 
         return [
-            ToolCallOutputItem(
-                output=str(result),
-                raw_item=ItemHelpers.tool_call_output_item(tool_run.tool_call, str(result)),
-                agent=agent,
+            FunctionToolResult(
+                tool=tool_run.function_tool,
+                output=result,
+                run_item=ToolCallOutputItem(
+                    output=result,
+                    raw_item=ItemHelpers.tool_call_output_item(tool_run.tool_call, str(result)),
+                    agent=agent,
+                ),
             )
             for tool_run, result in zip(tool_runs, results)
         ]
@@ -452,7 +529,8 @@ class RunImpl:
         run_config: RunConfig,
     ) -> SingleStepResult:
         # If there is more than one handoff, add tool responses that reject those handoffs
-        if len(run_handoffs) > 1:
+        multiple_handoffs = len(run_handoffs) > 1
+        if multiple_handoffs:
             output_message = "Multiple handoffs detected, ignoring this one."
             new_step_items.extend(
                 [
@@ -474,6 +552,16 @@ class RunImpl:
                 context_wrapper, actual_handoff.tool_call.arguments
             )
             span_handoff.span_data.to_agent = new_agent.name
+            if multiple_handoffs:
+                requested_agents = [handoff.handoff.agent_name for handoff in run_handoffs]
+                span_handoff.set_error(
+                    SpanError(
+                        message="Multiple handoffs requested",
+                        data={
+                            "requested_agents": requested_agents,
+                        },
+                    )
+                )
 
             # Append a tool output item for the handoff
             new_step_items.append(
@@ -645,6 +733,47 @@ class RunImpl:
 
             if event:
                 queue.put_nowait(event)
+
+    @classmethod
+    async def _check_for_final_output_from_tools(
+        cls,
+        *,
+        agent: Agent[TContext],
+        tool_results: list[FunctionToolResult],
+        context_wrapper: RunContextWrapper[TContext],
+        config: RunConfig,
+    ) -> ToolsToFinalOutputResult:
+        """Returns (i, final_output)."""
+        if not tool_results:
+            return _NOT_FINAL_OUTPUT
+
+        if agent.tool_use_behavior == "run_llm_again":
+            return _NOT_FINAL_OUTPUT
+        elif agent.tool_use_behavior == "stop_on_first_tool":
+            return ToolsToFinalOutputResult(
+                is_final_output=True, final_output=tool_results[0].output
+            )
+        elif isinstance(agent.tool_use_behavior, dict):
+            names = agent.tool_use_behavior.get("stop_at_tool_names", [])
+            for tool_result in tool_results:
+                if tool_result.tool.name in names:
+                    return ToolsToFinalOutputResult(
+                        is_final_output=True, final_output=tool_result.output
+                    )
+            return ToolsToFinalOutputResult(is_final_output=False, final_output=None)
+        elif callable(agent.tool_use_behavior):
+            if inspect.iscoroutinefunction(agent.tool_use_behavior):
+                return await cast(
+                    Awaitable[ToolsToFinalOutputResult],
+                    agent.tool_use_behavior(context_wrapper, tool_results),
+                )
+            else:
+                return cast(
+                    ToolsToFinalOutputResult, agent.tool_use_behavior(context_wrapper, tool_results)
+                )
+
+        logger.error(f"Invalid tool_use_behavior: {agent.tool_use_behavior}")
+        raise UserError(f"Invalid tool_use_behavior: {agent.tool_use_behavior}")
 
 
 class TraceCtxManager:
